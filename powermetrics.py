@@ -1,5 +1,12 @@
+import os
+import platform
+import shutil
 import subprocess
+import threading
+import time
 import xml.etree.ElementTree as ET
+from collections import defaultdict
+from datetime import datetime
 
 
 def parse_xml(xml_string):
@@ -42,61 +49,72 @@ def parseXmlObjToDict(xmlObj):
     return result
 
 
-def estimate_energy_impact_per_process(data):
-    # Get the total CPU energy from the processor section
-    total_cpu_energy = data['processor']['cpu_energy']
-    total_cpu_time = data['all_tasks']['cputime_ns']
+def energy_impact_to_co2_emission(energy_impact):
+    energy_impact_in_MWHr = energy_impact * 2.8 * 1e-13
+    energy_impact_in_US_co2_emission = energy_impact_in_MWHr * 0.475
 
-    # Initialize a dictionary to store the energy impact per process
-    energy_impact_per_process = {}
-
-    # Iterate over the tasks
-    for task in data['tasks']:
-        # Calculate the CPU time ratio for this task
-        cpu_time_ratio = task['cputime_ns'] / total_cpu_time
-
-        # Estimate the energy impact for this task
-        energy_impact = cpu_time_ratio * total_cpu_energy
-
-        # Store the energy impact in the dictionary
-        energy_impact_per_process[task['name']] = energy_impact
-
-    return energy_impact_per_process
+    return energy_impact_in_US_co2_emission
 
 
-def powermetrics_deamon(callback, report_interval=60):
-    process = subprocess.Popen(['powermetrics', '-i', str(report_interval * 1000), '--order', 'cputime', '--format', 'plist'],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+def powermetrics_daemon(callback, report_interval=60):
+    process_map = defaultdict(lambda: {'power': 0, 'samples': 0})
+    start_time = None
 
-    xml_output = ''
-    sample_count = 0
-    while True:
-        line = process.stdout.readline()
-        if line:
-            if xml_output.strip().endswith('</plist>'):  # assume this marks the end of a sample interval
-                sample_count += 1
-                print(f'Stats received for sample {sample_count}')
+    def aggregate_and_callback():
+        nonlocal start_time
+        while True:
+            if start_time is None:
+                start_time = datetime.now()
 
-                try:
-                    report = parse_xml(xml_output.lstrip('\x00').strip().encode('utf-8'))
+            time.sleep(report_interval)
+            stop_time = datetime.now()
 
-                    report['tasks'] = report['tasks'][:10]
-                    del report['network']
-                    del report['disk']
-                    del report['interrupts']
-                    del report['processor']['clusters']
-                    del report['gpu']
 
-                    estimate = estimate_energy_impact_per_process(report)
-                    callback(estimate)
+            aggregated_task_data = [
+                {'command': command, 'co2_emission': energy_impact_to_co2_emission(data['power'])}
+                for command, data in process_map.items()
+                if data['samples'] > 0 and data['power'] > 0
+            ]
+            callback({
+                'tasks': aggregated_task_data,
+                'start_time': start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                'stop_time': stop_time.strftime("%Y-%m-%d %H:%M:%S"),
+                'OS': platform.platform(),
+            })
+            process_map.clear()
+            start_time = stop_time  # Set start time for next interval to current stop time
 
-                except Exception as e:
-                    print(f"Unexpected error in sample {sample_count}: {e}")
-                    break
+    # Start the aggregation thread
+    threading.Thread(target=aggregate_and_callback, daemon=True).start()
 
-                finally:
-                    xml_output = ''
+    # Run the top command
+    cmd = ['top', '-stats', 'command,power', '-o', 'power', '-d']
+    try:
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                              universal_newlines=True) as process:
+            # Skip header lines
+            for _ in range(10):
+                next(process.stdout, None)
 
-            xml_output += line
-        else:
-            break  # exit the loop if there's no more output
+            # Process the output
+            for line in process.stdout:
+                line = line.strip()
+                if any(char in line for char in ',:/'):
+                    continue
+
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        command = ' '.join(parts[:-1])
+                        power = float(parts[-1])
+                        process_map[command]['power'] += power
+                        process_map[command]['samples'] += 1
+                    except ValueError:
+                        continue  # Skip lines where power can't be converted to float
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error running top command: {e}")
+    except KeyboardInterrupt:
+        print("Daemon stopped by user.")
+    finally:
+        print("Powermetrics daemon has stopped.")

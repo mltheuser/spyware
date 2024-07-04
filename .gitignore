@@ -2,3 +2,8 @@
 *.iml
 *.json
 *.xml
+.DS_Store
+
+build
+dist
+main.spec
