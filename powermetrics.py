@@ -1,11 +1,9 @@
 import os
 import platform
+import select
 import shutil
 import subprocess
-import threading
-import time
 import xml.etree.ElementTree as ET
-from collections import defaultdict
 from datetime import datetime
 
 
@@ -49,72 +47,181 @@ def parseXmlObjToDict(xmlObj):
     return result
 
 
-def energy_impact_to_co2_emission(energy_impact):
-    energy_impact_in_MWHr = energy_impact * 2.8 * 1e-13
-    energy_impact_in_US_co2_emission = energy_impact_in_MWHr * 0.475
+def gather_metrics_per_task(report):
+    metrics = {}
+    for task in report['tasks']:
+        task_specific_metrics = {}
+        task_specific_metrics['power'] = estimate_energy_impact_per_process(task, report)
+        metrics[task['name']] = task_specific_metrics
+    return metrics
 
-    return energy_impact_in_US_co2_emission
+
+def estimate_energy_impact_per_process(task, report):
+    # Get the total CPU energy from the processor section
+    total_cpu_time = report['all_tasks']['cputime_ns']
+
+    # Calculate the CPU time ratio for this task
+    cpu_time_ratio = task['cputime_ns'] / total_cpu_time
+
+    # Estimate the energy impact for this task
+    relative_energy_impact = cpu_time_ratio
+
+    # Imagine this is in mj then
+    energy_impact = relative_energy_impact * get_combined_power_from(report)
+
+    return energy_impact
+
+
+def _has_powermetrics_sudo():
+    # Check if sudo is available
+    if shutil.which("sudo") is None:
+        print("sudo not available, we won't use Apple PowerMetrics.")
+        return False
+
+    # Check if powermetrics is available
+    if shutil.which("powermetrics") is None:
+        print("Apple PowerMetrics not available. Please install it if you are using an Apple product.")
+        return False
+
+    # Check if the script runs with sudo privileges
+    if os.geteuid() != 0:
+        print("Needs to be run with sudo privileges.")
+        return False
+
+    # Try to run powermetrics with sudo
+    try:
+        process = subprocess.run(
+            [
+                "sudo", "-n",  # -n option to prevent prompting for password
+                "powermetrics",
+                "--samplers", "cpu_power",
+                "-n", "1",
+                "-i", "1",
+                "-o", "/dev/null",
+            ],
+            capture_output=False,
+            text=True,
+            timeout=5  # Set a timeout to prevent hanging
+        )
+
+        # Check the return code
+        if process.returncode != 0:
+            print(f"Failed to execute powermetrics. Return code: {process.returncode}")
+            return False
+
+        return True
+
+    except subprocess.TimeoutExpired:
+        print("Timeout while executing powermetrics.")
+        return False
+    except Exception as e:
+        print(f"An error occurred while checking PowerMetrics: {str(e)}")
+        return False
+
+
+def mw_to_joules(power_mw, interval_seconds):
+    power_w = power_mw / 1000  # Convert mW to W
+    return power_w * interval_seconds
+
+
+def get_interval_seconds_from(report):
+    return report['elapsed_ns'] * 1e-9
+
+
+def get_combined_power_from(report):
+    return mw_to_joules(report['processor']['combined_power'], get_interval_seconds_from(report))
+
+
+def filter_tasks_in(report):
+    # filter tasks
+    current_pid = os.getpid()
+    tasks = report.get('tasks', [])
+
+    # Find the current task and remove it from the list
+    current_task_data = None
+    filtered_tasks = []
+    for task in tasks:
+        if task.get('pid') == current_pid:
+            current_task_data = task
+        else:
+            filtered_tasks.append(task)
+
+    # Take the first 10 elements from the filtered tasks
+    top_10_tasks = filtered_tasks[:10]
+
+    # Append the current task data to the end if it exists
+    if current_task_data:
+        top_10_tasks.append(current_task_data)
+
+    # Update the report with the new task list
+    report['tasks'] = top_10_tasks
+
+    return report
 
 
 def powermetrics_daemon(callback, report_interval=60):
-    process_map = defaultdict(lambda: {'power': 0, 'samples': 0})
-    start_time = None
+    if not _has_powermetrics_sudo():
+        return
 
-    def aggregate_and_callback():
-        nonlocal start_time
-        while True:
-            if start_time is None:
-                start_time = datetime.now()
+    interval_seconds = report_interval * 1000
 
-            time.sleep(report_interval)
-            stop_time = datetime.now()
+    process = subprocess.Popen(
+        ['sudo', 'powermetrics', '-i', str(interval_seconds), '--order', 'cputime', '--format', 'plist'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 
+    xml_output = ''
+    sample_count = 0
+    start_time = datetime.now()
 
-            aggregated_task_data = [
-                {'command': command, 'co2_emission': energy_impact_to_co2_emission(data['power'])}
-                for command, data in process_map.items()
-                if data['samples'] > 0 and data['power'] > 0
-            ]
-            callback({
-                'tasks': aggregated_task_data,
-                'start_time': start_time.strftime("%Y-%m-%d %H:%M:%S"),
-                'stop_time': stop_time.strftime("%Y-%m-%d %H:%M:%S"),
-                'OS': platform.platform(),
-            })
-            process_map.clear()
-            start_time = stop_time  # Set start time for next interval to current stop time
+    def format_time(dt):
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Start the aggregation thread
-    threading.Thread(target=aggregate_and_callback, daemon=True).start()
+    # Set up select for non-blocking reads
+    readable = [process.stdout]
 
-    # Run the top command
-    cmd = ['top', '-stats', 'command,power', '-o', 'power', '-d']
-    try:
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
-                              universal_newlines=True) as process:
-            # Skip header lines
-            for _ in range(10):
-                next(process.stdout, None)
+    while True:
+        # Wait for data to be available, with a timeout
+        ready, _, _ = select.select(readable, [], [], interval_seconds)
 
-            # Process the output
-            for line in process.stdout:
-                line = line.strip()
-                if any(char in line for char in ',:/'):
-                    continue
+        if ready:
+            line = process.stdout.readline()
+            if not line:  # EOF
+                break
 
-                parts = line.split()
-                if len(parts) >= 2:
-                    try:
-                        command = ' '.join(parts[:-1])
-                        power = float(parts[-1])
-                        process_map[command]['power'] += power
-                        process_map[command]['samples'] += 1
-                    except ValueError:
-                        continue  # Skip lines where power can't be converted to float
+            xml_output += line
 
-    except subprocess.CalledProcessError as e:
-        print(f"Error running top command: {e}")
-    except KeyboardInterrupt:
-        print("Daemon stopped by user.")
-    finally:
-        print("Powermetrics daemon has stopped.")
+            if xml_output.strip().endswith('</plist>'):
+                sample_count += 1
+                stop_time = datetime.now()
+                print(f'Stats received for sample {sample_count}')
+
+                try:
+                    report = parse_xml(xml_output.lstrip('\x00').strip().encode('utf-8'))
+
+                    report = filter_tasks_in(report)
+
+                    task_metrics = gather_metrics_per_task(report)
+
+                    callback({
+                        'combined_power': get_combined_power_from(report),
+                        'tasks': task_metrics,
+                        'start_time': format_time(start_time),
+                        'stop_time': format_time(stop_time),
+                        'platform': platform.platform(),
+                    })
+
+                except Exception as e:
+                    print(f"Unexpected error in sample {sample_count}: {e}")
+                    break
+
+                finally:
+                    xml_output = ''
+                    start_time = stop_time  # Set the start_time for the next sample
+
+        # Check if the process has terminated
+        if process.poll() is not None:
+            break
+
+    # Clean up
+    process.terminate()
+    process.wait()
