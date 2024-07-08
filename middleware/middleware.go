@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type task struct {
@@ -123,6 +126,14 @@ func writePowermetricsToDB(w http.ResponseWriter, req *http.Request) {
 
 func main() {
 	fmt.Println("started")
+
+	// Open the database
+	db, err := sql.Open("sqlite3", "./test.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
 	http.HandleFunc("/powermetrics", writePowermetricsToDB)
 	http.ListenAndServe(":8090", nil)
 }
