@@ -6,6 +6,8 @@ import subprocess
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
+from id import generate_encoded_device_id
+
 
 def parse_xml(xml_string):
     try:
@@ -163,6 +165,8 @@ def powermetrics_daemon(callback, report_interval=60):
     if not _has_powermetrics_sudo():
         return
 
+    pc_id = generate_encoded_device_id()
+
     interval_seconds = report_interval * 1000
 
     process = subprocess.Popen(
@@ -203,6 +207,7 @@ def powermetrics_daemon(callback, report_interval=60):
                     task_metrics = gather_metrics_per_task(report)
 
                     callback({
+                        'pc_id': pc_id,
                         'combined_power': get_combined_power_from(report),
                         'tasks': task_metrics,
                         'start_time': format_time(start_time),
