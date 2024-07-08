@@ -6,6 +6,6 @@
 
 build
 dist
-main.spec
+*.spec
 
 go
