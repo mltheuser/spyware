@@ -52,8 +52,10 @@ def parseXmlObjToDict(xmlObj):
 def gather_metrics_per_task(report):
     metrics = []
     for task in report['tasks']:
-        task_specific_metrics = {'command': task['name']}
-        task_specific_metrics['power'] = estimate_energy_impact_per_process(task, report)
+        task_specific_metrics = {
+            'command': task['name'],
+            'power': estimate_energy_impact_per_process(task, report)
+        }
         metrics.append(task_specific_metrics)
     return metrics
 
