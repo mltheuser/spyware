@@ -53,7 +53,7 @@ def gather_metrics_per_task(report):
     metrics = []
     for task in report['tasks']:
         task_specific_metrics = {
-            'command': task['name'],
+            'command': task['name'].lower(),
             'power': estimate_energy_impact_per_process(task, report)
         }
         metrics.append(task_specific_metrics)
@@ -155,6 +155,7 @@ def filter_tasks_in(report):
 
     # Append the current task data to the end if it exists
     if current_task_data:
+        current_task_data['name'] = 'power observer'
         top_10_tasks.append(current_task_data)
 
     # Update the report with the new task list
