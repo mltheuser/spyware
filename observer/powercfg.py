@@ -5,10 +5,11 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 import heapq
-from reset import reset_measurements
-from id import generate_encoded_device_id
 from collections import defaultdict
 import psutil
+
+from id import generate_encoded_device_id
+
 
 def collect_srumutil_data():
     report_path = os.path.join(os.environ['TEMP'], 'energy_report.xml')
