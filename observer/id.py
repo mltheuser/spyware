@@ -9,7 +9,7 @@ def get_mac_address():
     return ':'.join(['{:02x}'.format((uuid.getnode() >> elements) & 0xff) for elements in range(0, 2 * 6, 2)][::-1])
 
 
-def get_system_specific_salt():
+def get_system_specific_seed():
     # Collect various pieces of system-specific information
     system = platform.system()
     if system == "Windows":
@@ -42,19 +42,18 @@ def get_system_specific_salt():
     total_ram = str(psutil.virtual_memory().total)
     hostname = platform.node()
 
+    mac_address = get_mac_address()
+
     # Combine all information into a single string
-    return f"{system}:{cpu_id}:{disk_serial}:{total_ram}:{hostname}"
+    return f"{mac_address}:{system}:{cpu_id}:{disk_serial}:{total_ram}:{hostname}".encode('utf-8')
 
 
 def generate_encoded_device_id(iterations=1000):
-    # Get system-specific salt
-    salt = get_system_specific_salt()
-
     # Combine MAC address and salt
-    salted = (get_mac_address() + salt).encode('utf-8')
+    seed = get_system_specific_seed()
 
     # Perform key stretching
-    hash_object = hashlib.sha256(salted)
+    hash_object = hashlib.sha256(seed)
     for i in range(iterations):
         hash_object = hashlib.sha256(hash_object.digest())
 
