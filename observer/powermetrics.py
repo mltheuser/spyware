@@ -1,59 +1,40 @@
 import os
 import platform
+import plistlib
+import re
 import shutil
 import subprocess
-import xml.etree.ElementTree as ET
 from datetime import datetime
+
+from app_icon import get_app_icon
 from battery_info import get_battery_info
 from id import generate_encoded_device_id
 
 
-def parse_xml(xml_string):
-    try:
-        root = ET.fromstring(xml_string)
+def translate_app_name(name):
+    # Remove "com." at the start if present
+    if name.startswith("com."):
+        name = name[4:]
 
-        result = parseXmlObjToDict(root[0])
+    # Split the name into words based on underscores and dots
+    words = re.split(r"[_.]", name)
 
-        return result
-    except ET.ParseError as e:
-        print(f"Error parsing xml at line {e.position[0]}, column {e.position[1]}")
-        raise e
+    # Capitalize the first letter of each word and make the rest lowercase
+    words = [word.capitalize() for word in words]
 
-
-def parseXmlObjToDict(xmlObj):
-    result = {}
-
-    pointer = 0
-    while pointer < len(xmlObj):
-        key_element = xmlObj[pointer]
-        assert key_element.tag == 'key'
-
-        value_element = xmlObj[pointer + 1]
-
-        if value_element.tag in 'integer':
-            result[key_element.text] = int(value_element.text)
-        elif value_element.tag in 'real':
-            result[key_element.text] = float(value_element.text)
-        elif value_element.tag in 'string':
-            result[key_element.text] = str(value_element.text)
-        elif value_element.tag in 'array':
-            result[key_element.text] = [parseXmlObjToDict(obj) for obj in value_element]
-        elif value_element.tag in 'dict':
-            result[key_element.text] = parseXmlObjToDict(value_element)
-        else:
-            result[key_element.text] = value_element.tag
-
-        pointer += 2
-
-    return result
+    # Join the words with whitespace and return the result
+    return " ".join(words)
 
 
 def gather_metrics_per_task(report, total_power):
     metrics = []
-    for task in report['tasks']:
+    for task in report['coalitions']:
         task_specific_metrics = {
-            'task_name': task['name'].lower(),
-            'energy_consumption': estimate_energy_impact_per_process(task, report, total_power)
+            'task_name': translate_app_name(task['name']),
+            'energy_consumption': estimate_energy_impact_per_process(task, report, total_power),
+            'details': {
+                'icon': get_app_icon(task['name'])
+            }
         }
         metrics.append(task_specific_metrics)
     return metrics
@@ -125,30 +106,28 @@ def _has_powermetrics_sudo():
 def filter_tasks_in(report):
     # filter tasks
     current_pid = os.getpid()
-    tasks = report.get('tasks', [])
+    coalitions = report.get('coalitions', [])
+
+    # Sort the filtered tasks by 'energy_impact' in descending order
+    coalitions.sort(key=lambda x: x.get('energy_impact', 0), reverse=True)
+
+    # Take the first 10 elements from the filtered tasks
+    top_10_tasks = coalitions[:10]
 
     # Find the current task and remove it from the list
     current_task_data = None
-    filtered_tasks = []
-    for task in tasks:
-        if task.get('pid') == current_pid:
-            current_task_data = task
-        else:
-            filtered_tasks.append(task)
-
-    # Sort the filtered tasks by 'energy_impact' in descending order
-    filtered_tasks.sort(key=lambda x: x.get('energy_impact', 0), reverse=True)
-
-    # Take the first 10 elements from the filtered tasks
-    top_10_tasks = filtered_tasks[:10]
-
+    for coalition in coalitions:
+        for task in coalition['tasks']:
+            if task.get('pid') == current_pid:
+                current_task_data = task
+                break
     # Append the current task data to the end if it exists
     if current_task_data:
         current_task_data['name'] = 'Power Observer'
         top_10_tasks.append(current_task_data)
 
     # Update the report with the new task list
-    report['tasks'] = top_10_tasks
+    report['coalitions'] = top_10_tasks
 
     return report
 
@@ -186,7 +165,8 @@ def powermetrics_daemon(callback, report_interval=60):
 
     interval_milli_seconds = report_interval * 1000
     process = subprocess.Popen(
-        ['sudo', 'powermetrics', '-i', str(interval_milli_seconds), '--show-process-energy', '--format', 'plist'],
+        ['sudo', 'powermetrics', '-i', str(interval_milli_seconds), '--show-process-energy', '--show-process-coalition',
+         '--format', 'plist'],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 
     xml_output = []
@@ -209,7 +189,7 @@ def powermetrics_daemon(callback, report_interval=60):
                 battery_info = get_battery_info()
                 total_power_consumption = compute_energy_consumption(start_battery, battery_info)
 
-                report = parse_xml(xml_string.lstrip('\x00').strip().encode('utf-8'))
+                report = plistlib.loads(xml_string.lstrip('\x00').strip().encode('utf-8'))
 
                 report = filter_tasks_in(report)
 
@@ -226,8 +206,7 @@ def powermetrics_daemon(callback, report_interval=60):
 
                 pass
             except Exception as e:
-                print(f"Unexpected error in sample: {e}")
-                break
+                raise e
 
             finally:
                 xml_output = []
